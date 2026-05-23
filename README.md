@@ -1,0 +1,1 @@
+# Simple DNS Proxy Resolver for gRPC DNS Service (HTTP/2 Streams over Unix Sockets)
