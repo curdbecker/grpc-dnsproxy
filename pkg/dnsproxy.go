@@ -1,4 +1,4 @@
-// dnsproxy: CoreDNS gRPC DnsService implementation on a Unix socket.
+// CoreDNS gRPC DnsService implementation on a Unix socket.
 //
 // Protocol on the wire is exactly what the CoreDNS grpc plugin defines:
 //
@@ -17,17 +17,15 @@
 // Transport: gRPC (HTTP/2 prior-knowledge h2c) over a Unix socket.
 // google.golang.org/grpc handles all HTTP/2 framing, trailers and
 // status codes correctly; we just register the service.
-package main
+package dnsproxy
 
 import (
 	"context"
-	"flag"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/coredns/coredns/pb"
@@ -41,13 +39,81 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-var (
-	upstreamTO time.Duration
-	defaultTTL uint32
-	logQueries bool
-)
+type Config struct {
+	// At least one of these must be set.
+	ListenInternal string
+	ListenExternal string
 
-func listen(listenPath string, hosts *txeh.Hosts, nameservers []string) func() {
+	// Optional. If empty, hosts-file lookups are skipped.
+	Hosts *txeh.Hosts
+
+	// Upstream nameservers
+	Nameservers []string
+
+	// Upstream resolver timeout. Defaults to 4s if zero.
+	UpstreamTimeout time.Duration
+
+	// TTL for hosts-file answers in seconds. Defaults to 60 if zero.
+	HostsTTL uint32
+
+	// Log every query and its outcome.
+	LogQueries bool
+}
+
+func GetNameserversFromResolvConf(resolvconfPath string) ([]string, error) {
+	var resolvconfBytes []byte
+	var err error
+
+	if resolvconfBytes, err = os.ReadFile(resolvconfPath); err != nil {
+		return nil, fmt.Errorf("failed to read %s: %s", resolvconfPath, err)
+	}
+
+	nameservers := resolvconf.GetNameservers(resolvconfBytes, types.IP)
+	if len(nameservers) == 0 {
+		return nil, fmt.Errorf("no nameservers found in %s", resolvconfPath)
+	}
+
+	return nameservers, nil
+}
+
+// Run starts the resolver(s) and blocks until ctx is cancelled. All
+// gRPC servers are GracefulStop()ed and socket files are removed
+// before Run returns.
+func Run(ctx context.Context, cfg Config) error {
+	var err error
+
+	if cfg.ListenInternal == "" && cfg.ListenExternal == "" {
+		return errors.New("dnsproxy: at least one of ListenInternal/ListenExternal is required")
+	}
+
+	if len(cfg.Nameservers) == 0 {
+		resolvconfPath := "/etc/resolv.conf"
+		cfg.Nameservers, err = GetNameserversFromResolvConf(resolvconfPath)
+		if err != nil {
+			return fmt.Errorf("failed to open %s: %s", resolvconfPath, err)
+		}
+	}
+
+	if cfg.UpstreamTimeout == 0 {
+		cfg.UpstreamTimeout = 4 * time.Second
+	}
+	if cfg.HostsTTL == 0 {
+		cfg.HostsTTL = 60
+	}
+
+	if cfg.ListenInternal != "" {
+		defer startListener(cfg.ListenInternal, cfg)()
+	}
+
+	if cfg.ListenExternal != "" {
+		defer startListener(cfg.ListenExternal, cfg)()
+	}
+
+	<-ctx.Done()
+	return nil
+}
+
+func startListener(listenPath string, config Config) func() {
 	os.Remove(listenPath)
 
 	l, err := net.Listen("unix", listenPath)
@@ -60,9 +126,8 @@ func listen(listenPath string, hosts *txeh.Hosts, nameservers []string) func() {
 
 	srv := grpc.NewServer()
 	pb.RegisterDnsServiceServer(srv, &dnsService{
-		hosts:       hosts,
-		socket:      listenPath,
-		nameservers: nameservers,
+		socket: listenPath,
+		config: config,
 	})
 
 	log.Printf("listening on unix:%s", listenPath)
@@ -79,69 +144,13 @@ func listen(listenPath string, hosts *txeh.Hosts, nameservers []string) func() {
 	}
 }
 
-func main() {
-	var resolvconfPath string
-	var listenInternalPath string
-	var listenExternalPath string
-	var hostsPath string
-
-	flag.StringVar(&listenInternalPath, "listen-internal", "", "Unix socket path to listen on for internal requests")
-	flag.StringVar(&listenExternalPath, "listen-external", "", "Unix socket path to listen on for external requests")
-	flag.StringVar(&hostsPath, "hosts", "", "hosts file for lookups")
-	flag.StringVar(&resolvconfPath, "resolvconf", "/etc/resolv.conf", "path to resolv.conf - default /etc/resolv.conf")
-	flag.DurationVar(&upstreamTO, "timeout", 4*time.Second, "upstream resolver timeout for external lookups")
-	var ttl uint
-	flag.UintVar(&ttl, "ttl", 60, "TTL (seconds) for hosts file answers")
-	flag.BoolVar(&logQueries, "log", false, "log every query and its outcome")
-	flag.Parse()
-	defaultTTL = uint32(ttl)
-
-	if listenInternalPath == "" && listenExternalPath == "" {
-		log.Fatalf("must provide one of -listen-internal or listen-external")
-	}
-
-	var hosts *txeh.Hosts
-	var err error
-	if hostsPath != "" {
-		hosts, err = txeh.NewHosts(&txeh.HostsConfig{
-			ReadFilePath: hostsPath,
-		})
-		if err != nil {
-			log.Fatalf("failed to read hosts file: %s", err)
-		}
-	}
-
-	var resolvconfBytes []byte
-	if resolvconfBytes, err = os.ReadFile(resolvconfPath); err != nil {
-		log.Fatalf("failed to read %s: %s", resolvconfPath, err)
-	}
-	nameservers := resolvconf.GetNameservers(resolvconfBytes, types.IP)
-	if len(nameservers) == 0 {
-		log.Fatalf("no nameservers found in %s", resolvconfPath)
-	}
-
-	if listenInternalPath != "" {
-		defer listen(listenInternalPath, hosts, nameservers)()
-	}
-
-	if listenExternalPath != "" {
-		defer listen(listenExternalPath, hosts, nameservers)()
-	}
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
-	log.Println("shutting down")
-}
-
 // ---------- gRPC service ----------
 
 type dnsService struct {
 	pb.UnimplementedDnsServiceServer
-	hosts       *txeh.Hosts
-	socket      string
-	nameservers []string
-	nsIndex     int
+	config  Config
+	socket  string
+	nsIndex int
 }
 
 func (s *dnsService) Query(ctx context.Context, in *pb.DnsPacket) (*pb.DnsPacket, error) {
@@ -153,7 +162,7 @@ func (s *dnsService) Query(ctx context.Context, in *pb.DnsPacket) (*pb.DnsPacket
 	var reply *dns.Msg
 	var source string
 
-	if s.hosts != nil {
+	if s.config.Hosts != nil {
 		reply = s.lookupInHosts(q)
 		source = "hosts"
 	}
@@ -162,7 +171,7 @@ func (s *dnsService) Query(ctx context.Context, in *pb.DnsPacket) (*pb.DnsPacket
 		reply = s.forwardToUpstream(ctx, q, source)
 	}
 
-	if logQueries {
+	if s.config.LogQueries {
 		log.Printf("%s: result by %s -> response:\n%s", s.socket, source, reply)
 	}
 
@@ -184,10 +193,10 @@ func makeQueryResponse(q *dns.Msg, responseCode int) *dns.Msg {
 }
 
 func (s *dnsService) getNextNameserver() string {
-	nameserver := s.nameservers[s.nsIndex]
+	nameserver := s.config.Nameservers[s.nsIndex]
 
 	s.nsIndex += 1
-	if s.nsIndex >= len(s.nameservers) {
+	if s.nsIndex >= len(s.config.Nameservers) {
 		s.nsIndex = 0
 	}
 
@@ -198,15 +207,16 @@ func (s *dnsService) lookupInHosts(q *dns.Msg) *dns.Msg {
 	if len(q.Question) > 1 {
 		log.Print("multiple questions received for query - first question is answered")
 	}
+	hosts := s.config.Hosts
 
 	qq := q.Question[0]
 	hdr := dns.RR_Header{Name: dns.Fqdn(qq.Name), Class: dns.ClassINET,
-		Ttl: defaultTTL, Rrtype: qq.Qtype}
+		Ttl: s.config.HostsTTL, Rrtype: qq.Qtype}
 	var records []dns.RR
 
 	switch qq.Qtype {
 	case dns.TypeA:
-		found, answer, _ := s.hosts.HostAddressLookup(qq.Name, txeh.IPFamilyV4)
+		found, answer, _ := hosts.HostAddressLookup(qq.Name, txeh.IPFamilyV4)
 		if !found {
 			break
 		}
@@ -214,7 +224,7 @@ func (s *dnsService) lookupInHosts(q *dns.Msg) *dns.Msg {
 		records = append(records, &dns.A{Hdr: hdr, A: v4})
 
 	case dns.TypeAAAA:
-		found, answer, _ := s.hosts.HostAddressLookup(qq.Name, txeh.IPFamilyV6)
+		found, answer, _ := hosts.HostAddressLookup(qq.Name, txeh.IPFamilyV6)
 		if !found {
 			break
 		}
@@ -222,7 +232,7 @@ func (s *dnsService) lookupInHosts(q *dns.Msg) *dns.Msg {
 		records = append(records, &dns.AAAA{Hdr: hdr, AAAA: v6})
 	case dns.TypePTR:
 		address := dnsutil.ExtractAddressFromReverse(qq.Name)
-		for _, hostname := range s.hosts.ListHostsByIP(address) {
+		for _, hostname := range hosts.ListHostsByIP(address) {
 			records = append(records, &dns.PTR{Hdr: hdr, Ptr: hostname})
 		}
 	}
@@ -241,7 +251,7 @@ func (s *dnsService) forwardToUpstream(ctx context.Context,
 	q *dns.Msg, nameserver string) *dns.Msg {
 
 	client := new(dns.Client)
-	ctx, cancel := context.WithTimeout(ctx, upstreamTO)
+	ctx, cancel := context.WithTimeout(ctx, s.config.UpstreamTimeout)
 	defer cancel()
 
 	forwarded, _, err := client.ExchangeContext(ctx, q, nameserver)
