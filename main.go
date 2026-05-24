@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
-	dnsproxy "dnsproxy/pkg"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	dnsproxy "github.com/curdbecker/grpc-dnsproxy/pkg"
 
 	"github.com/txn2/txeh"
 )
